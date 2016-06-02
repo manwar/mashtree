@@ -9,6 +9,7 @@ use Data::Dumper;
 use Getopt::Long;
 use File::Temp qw/tempdir tempfile/;
 use File::Basename qw/basename dirname fileparse/;
+use File::Copy qw/move/;
 use Bio::Tree::DistanceFactory;
 use Bio::Matrix::IO;
 use Bio::Tree::Statistics;
@@ -103,6 +104,7 @@ sub main{
   }
 
   print $bs_tree->as_text('newick');
+  print "\n"; # prettier output with a newline
   
   return 0;
 }
@@ -154,16 +156,11 @@ sub makeBootstrapReads{
   return [] if($reps < 1);
   
   # Enqueue the reads with a replicate ID
-  my $readsQ=Thread::Queue->new();
-  for(my $i=1;$i<=$reps;$i++){
-    for my $r(@$reads){
-      $readsQ->enqueue([$i,$r]);
-    }
-  }
+  my $readsQ=Thread::Queue->new(@$reads);
 
   my @thr;
   for(0..$$settings{numcpus}-1){
-    $thr[$_]=threads->new(\&subsampleReads, $readsQ, $settings);
+    $thr[$_]=threads->new(\&subsampleReads, $reps, $readsQ, $settings);
   }
 
   my @terminator=(undef) x scalar(@thr);
@@ -179,32 +176,26 @@ sub makeBootstrapReads{
 }
 
 sub subsampleReads{
-  my($readsQ,$settings)=@_;
+  my($reps,$readsQ,$settings)=@_;
   my @fastqOut;
-  while(defined(my $tmp=$readsQ->dequeue())){
-    my($rep,$r)=@$tmp;
-    my $readsFh=openFastq($r,$settings);
-
-    # subsample each fastq file
-    my $readCount=0;
-    my $outdir="$$settings{tempdir}/subsampledReads/$rep";
+  while(defined(my $r=$readsQ->dequeue())){
+    my $outdir="$$settings{tempdir}/subsampledReads/".basename($r,@fastqExt);
     system("mkdir -p $outdir");
-    my $outfile="$outdir/".basename($r,@fastqExt).".fastq";
-    push(@fastqOut,$outfile);
+    my $numReadsList=printRandomReadsToFiles($r,$outdir,$reps,$settings);
+    my @subsampledFastq=glob("$outdir/*.fastq $outdir/*.fastq.gz");
+    for(my $i=0;$i<$reps;$i++){
+      # TODO check to make sure each file has enough entries
+      # in it. If not, then remake it (right?)
 
-    logmsg "(rep $rep) Getting random reads from $r";
-    
-    # Use CGP to get random entries via downsampling.
-    # Get the first 88888 lines of the fastq file.
-    # Any number ending in 888 is a multiple of 8, so it doesn't
-    # split up any fastq entries.
-    printRandomReadsToFile($r,$outfile,$settings);
+      # Move the rep into a subsample folder and do not
+      # change the extension so that we can preserve
+      # the user's choice on gzipped-ness
+      my $newOut="$$settings{tempdir}/subsampledReads/$i/".basename($r);
+      move($subsampledFastq[$i],$newOut);
+      push(@fastqOut,$newOut);
+    }
   }
-
-  # Return a unique list because the re-enqueuing nonsense
-  # might make duplicate entries.
-  # TODO: I probably don't need to uniq this because I'm not requeuing anymore.
-  return [uniq(@fastqOut)];
+  return \@fastqOut;
 }
 
 # Run mash sketch on everything, multithreaded.
@@ -373,6 +364,7 @@ sub createTree{
   my $treeObj = $dfactory->make_tree($matrix);
   open(TREE,">","$outdir/tree.dnd") or die "ERROR: could not open $outdir/tree.dnd: $!";
   print TREE $treeObj->as_text("newick");
+  print TREE "\n"; # make the output file a bit prettier with a newline
   close TREE;
 
   return $treeObj;
@@ -383,6 +375,52 @@ sub createTree{
 # Utils
 #######
 
+# Make many output files of random reads from an input file.
+# All output files will be under $outdir which should be
+# a previously empty directory.
+sub printRandomReadsToFiles{
+  my($infile,$outdir,$numFiles,$settings)=@_;
+
+  # Open a ton of output files
+  my @numEntries;
+  my @outFh;
+  logmsg "Writing subsampling files for $infile";
+  for(my $i=0;$i<$numFiles;$i++){
+    $numEntries[$i]=0;
+    open($outFh[$i],">","$outdir/$i.fastq") or die "ERROR: I could not open $outdir/$i.fastq";
+  }
+
+  # Read the input file
+  my $fh=openFastq($infile,$settings);
+  while(my $entry=<$fh> . <$fh> . <$fh> . <$fh>){
+    for(my $i=0;$i<$numFiles;$i++){
+
+      next if(rand() < 0.5);
+      next if($numEntries[$i] >= 10000);
+
+      my $outFh=$outFh[$i];
+      print $outFh $entry;
+      $numEntries[$i]++;
+    }
+  }
+  
+  # Close a ton of file handles
+  close $fh;
+  for(@outFh){
+    close $_;
+  }
+
+  if($$settings{'save-space'}){
+    system("gzip -f $outdir/*.fastq");
+    die if $?;
+  }
+  logmsg "Done subsampling $infile";
+
+  return \@numEntries;
+}
+
+# Deprecated
+# Make one output file of random reads from an input file
 sub printRandomReadsToFile{
   my($infile,$outfile,$settings)=@_;
 
